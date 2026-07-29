@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+
+.pipeline_cache/
+pipeline_output/
+Top_100_segments/
+out/

@@ -60,10 +60,7 @@ DEFAULT_CHAT_MODEL = "gpt-4.1-mini"
 DEFAULT_CHUNK_MINUTES = 10
 DEFAULT_OVERLAP_SECONDS = 15
 
-_base_url = os.environ.get(
-    "OPENAI_BASE_URL",
-    "https://go.apis.huit.harvard.edu/ais-openai-direct/v1/",
-)
+_base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 _api_key = os.environ.get("OPENAI_API_KEY", "")
 
 client = OpenAI(

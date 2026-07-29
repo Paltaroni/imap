@@ -73,10 +73,7 @@ EMBED_BATCH_SIZE = 100
 MAX_EMBED_CHARS = 2000
 CLUSTER_ALGORITHMS = ["kmeans", "spherical-kmeans", "agglomerative", "hdbscan"]
 
-_base_url = os.environ.get(
-    "OPENAI_BASE_URL",
-    "https://go.apis.huit.harvard.edu/ais-openai-direct/v1/",
-)
+_base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 _api_key = os.environ.get("OPENAI_API_KEY", "")
 
 client = OpenAI(
