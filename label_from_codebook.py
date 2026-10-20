@@ -2,11 +2,9 @@
 """
 label_from_codebook.py — Direct per-segment topic labeling against a fixed codebook.
 
-Unlike direct_presegmented.py (which lets the LLM free-generate a topic label per
-segment), this script constrains every classification to a closed set of categories
-you supply. Each segment gets exactly one label, chosen from the codebook via a
-JSON-schema enum -- the model cannot invent a new label string, so there's no
-label drift to consolidate afterward.
+This script classifies from a closed set of categories in a csv/plain text file. 
+Each segment gets exactly one label, chosen from the codebook via a
+JSON-schema enum.
 
 Expects a CSV with at least these columns:
   video_url, segment_transcript, timecode_in, timecode_out, segment_duration_seconds
@@ -15,8 +13,11 @@ All other columns are passed through to the output.
 
 Codebook:
   --codebook accepts either:
-    - a CSV with a `label` column (any other columns are ignored)
-    - a plain text file, one category per line (blank lines ignored)
+    - a CSV with a `label` column and an optional `definition` column
+      (use --definitions-column if your definitions column has another name)
+    - a plain text file, one category per line, optionally as `label: definition`
+      (blank lines ignored)
+  Definitions, when given, are shown to the model next to each category.
   An "Other / Not Listed" category is added automatically if your codebook
   doesn't already have an equivalent, so segments that genuinely don't fit
   aren't force-matched to the closest wrong category.
@@ -45,7 +46,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -63,21 +64,17 @@ except ImportError:
 
 csv.field_size_limit(10**7)
 
-DEFAULT_CHAT_MODEL = "gpt-5.6-sol"
+DEFAULT_CHAT_MODEL = "gpt-4.1-mini"
 OTHER_LABEL = "Other / Not Listed"
 MAX_TRANSCRIPT_CHARS = 700
 DEFAULT_BATCH_SIZE = 20
 
-_base_url = os.environ.get(
-    "OPENAI_BASE_URL",
-    "https://go.apis.huit.harvard.edu/ais-openai-direct/v1/",
-)
+_base_url = os.environ.get("OPENAI_BASE_URL") or None  # None = the standard OpenAI endpoint
 _api_key = os.environ.get("OPENAI_API_KEY", "")
 
 client = OpenAI(
     api_key=_api_key,
     base_url=_base_url,
-    default_headers={"api-key": _api_key},
     timeout=90.0,
 )
 
@@ -170,24 +167,44 @@ def load_presegmented_csv(path: str) -> List[Dict[str, Any]]:
     return segments
 
 
-def load_codebook(path: str) -> List[str]:
+def load_codebook(path: str, definitions_column: str = "definition") -> Tuple[List[str], Dict[str, str]]:
+    """Read labels and, when present, a one-line definition per label.
+
+    CSV: a `label` column plus an optional definitions column (default name: `definition`).
+    Text: one category per line, optionally written as `label: definition`.
+    Returns (labels, definitions keyed by lowercased label).
+    """
     p = Path(path)
     labels: List[str] = []
+    definitions: Dict[str, str] = {}
     if p.suffix.lower() == ".csv":
         with open(p, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            if "label" not in (reader.fieldnames or []):
-                die(f"--codebook CSV must have a 'label' column (found: {reader.fieldnames})")
+            fields = reader.fieldnames or []
+            if "label" not in fields:
+                die(f"--codebook CSV must have a 'label' column (found: {fields})")
+            has_defs = definitions_column in fields
+            if not has_defs and len(fields) > 1:
+                print(f"  note: no {definitions_column!r} column in {path}, so no definitions loaded "
+                      f"(columns: {fields}); set --definitions-column to use one", flush=True)
             for row in reader:
                 val = (row.get("label") or "").strip()
                 if val:
                     labels.append(val)
+                    if has_defs and (defn := (row.get(definitions_column) or "").strip()):
+                        definitions.setdefault(val.lower(), defn)
     else:
         with open(p, encoding="utf-8") as f:
             for line in f:
-                val = line.strip()
-                if val:
-                    labels.append(val)
+                line = line.strip()
+                if not line:
+                    continue
+                label, _, defn = line.partition(":")
+                label, defn = label.strip(), defn.strip()
+                if label:
+                    labels.append(label)
+                    if defn:
+                        definitions.setdefault(label.lower(), defn)
 
     # de-dupe, preserve order
     seen = set()
@@ -200,8 +217,8 @@ def load_codebook(path: str) -> List[str]:
     if not any(l.lower() in (OTHER_LABEL.lower(), "other", "not listed", "none", "n/a") for l in deduped):
         deduped.append(OTHER_LABEL)
 
-    print(f"Loaded codebook: {len(deduped)} categories from {path}", flush=True)
-    return deduped
+    print(f"Loaded codebook: {len(deduped)} categories, {len(definitions)} with definitions, from {path}", flush=True)
+    return deduped, definitions
 
 
 def load_definitions(path: str, column: str) -> Dict[str, str]:
@@ -351,9 +368,10 @@ def run(args: argparse.Namespace) -> None:
     if not all_segments:
         die("No valid segments found in CSV")
 
-    labels = load_codebook(args.codebook)
-    definitions = load_definitions(args.codebook_definitions, args.definitions_column) if args.codebook_definitions else None
-    system = build_system_prompt(labels, definitions)
+    labels, definitions = load_codebook(args.codebook, args.definitions_column)
+    if args.codebook_definitions:  # a separate definitions file overrides any definitions in --codebook
+        definitions.update(load_definitions(args.codebook_definitions, args.definitions_column))
+    system = build_system_prompt(labels, definitions or None)
     schema = build_schema(labels)
 
     batches = [all_segments[i:i + args.batch_size] for i in range(0, len(all_segments), args.batch_size)]
@@ -424,9 +442,9 @@ def main() -> None:
         description="Directly label pre-segmented transcript rows against a fixed codebook of categories."
     )
     ap.add_argument("--input", required=True, help="Pre-segmented CSV with video_url and segment_transcript columns")
-    ap.add_argument("--codebook", required=True, help="CSV with a 'label' column, or a plain text file (one category per line)")
-    ap.add_argument("--codebook-definitions", default=None, help="Optional CSV with a 'label' column and a definitions column, used to give the model a one-sentence description per category")
-    ap.add_argument("--definitions-column", default="definition", help="Column name in --codebook-definitions to use as the definition text (default: definition)")
+    ap.add_argument("--codebook", required=True, help="CSV with a 'label' column and an optional definitions column, or a plain text file (one 'label' or 'label: definition' per line)")
+    ap.add_argument("--codebook-definitions", default=None, help="Optional separate CSV with 'label' and definitions columns; overrides definitions found in --codebook")
+    ap.add_argument("--definitions-column", default="definition", help="Name of the definitions column in the codebook CSV (and in --codebook-definitions) (default: definition)")
     ap.add_argument("--output-dir", default="pipeline_output", help="Directory for segments.json, codebook_summary.csv, labeled_segments.csv")
     ap.add_argument("--model", default=DEFAULT_CHAT_MODEL, help=f"Chat model for classification (default: {DEFAULT_CHAT_MODEL})")
     ap.add_argument("--cache-dir", default=".pipeline_cache", help="Directory for caching LLM responses")

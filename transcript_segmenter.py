@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-transcript_segmenter.py — Split transcripts into topic segments for human labeling.
+transcript_segmenter.py — Split transcripts into topic segments.
 
 Uses an LLM to detect topic-shift boundaries in transcripts, but does NOT label
-the topics. Output is intended for human review and labeling before running
-sentiment analysis.
+the topics. Label the segments next with label_from_codebook.py, or by hand by
+filling in the `topic` column of segments_review.csv.
 
 Usage:
   python3 transcript_segmenter.py --input videos.csv --output-dir out/
 
-  Then open out/segments_review.csv, fill in the `topic` column for each row,
-  and use that as input for the sentiment phase of direct_topic_pipeline.py.
-
-Output files (written to --output-dir):
+Output files (written to a timestamped subfolder of --output-dir):
   segments.json        — all segments with metadata + timecodes + transcript text
-  segments_review.csv  — one row per segment, with empty `topic` column for human labeling
+  segments_review.csv  — one row per segment (video_url + segment_id identify it),
+                         with an empty `topic` column for optional human labeling
 
 Auth:
   export OPENAI_API_KEY="..."
@@ -60,13 +58,12 @@ DEFAULT_CHAT_MODEL = "gpt-4.1-mini"
 DEFAULT_CHUNK_MINUTES = 10
 DEFAULT_OVERLAP_SECONDS = 15
 
-_base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+_base_url = os.environ.get("OPENAI_BASE_URL") or None  # None = the standard OpenAI endpoint
 _api_key = os.environ.get("OPENAI_API_KEY", "")
 
 client = OpenAI(
     api_key=_api_key,
     base_url=_base_url,
-    default_headers={"api-key": _api_key},
 )
 
 
@@ -705,7 +702,7 @@ def run(args: argparse.Namespace) -> None:
         die("OPENAI_API_KEY not set")
 
     # Each run gets its own timestamped subfolder so previous runs are never overwritten.
-    # e.g. Top_100_segments/2026-06-22_143052_videos/
+    # e.g. segments_out/2026-06-22_143052_videos/
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     input_stem = Path(args.input).stem
     run_dir = Path(args.output_dir) / f"{timestamp}_{input_stem}"
@@ -754,12 +751,14 @@ def run(args: argparse.Namespace) -> None:
             continue
         print(f"  {len(bounds)} segments", flush=True)
         normed = ensure_end_ms(transcript)
+        segment_id = 0  # position of the segment within its video; with video_url it identifies a segment
         for a, b in bounds:
             text = transcript_text(normed, a, b).strip()
             if text:
                 all_segments.append({
                     "video_url": url,
                     **metadata,
+                    "segment_id": segment_id,
                     "timecode_in_ms": a,
                     "timecode_out_ms": b,
                     "timecode_in": ms_to_timecode(a),
@@ -768,6 +767,7 @@ def run(args: argparse.Namespace) -> None:
                     "segment_transcript": text,
                     "topic": "",
                 })
+                segment_id += 1
 
     print(f"\nTotal segments: {len(all_segments)}", flush=True)
     if not all_segments:
@@ -781,7 +781,7 @@ def run(args: argparse.Namespace) -> None:
     # Write review CSV for human labeling — one row per segment
     review_path = output_dir / "segments_review.csv"
     review_fields = [
-        "video_url", "title", "creator_label", "upload_date",
+        "video_url", "segment_id", "title", "creator_label", "upload_date",
         "timecode_in", "timecode_out", "segment_duration_seconds",
         "topic",  # empty — for human to fill in
         "segment_transcript_preview",
@@ -805,8 +805,8 @@ def main() -> None:
     )
     ap.add_argument("--input", required=True,
                     help="Input CSV with source_url, transcript, and duration_seconds columns")
-    ap.add_argument("--output-dir", default="Top_100_segments",
-                    help="Parent directory for run outputs (default: Top_100_segments). "
+    ap.add_argument("--output-dir", default="segments_out",
+                    help="Parent directory for run outputs (default: segments_out). "
                          "Each run creates a timestamped subfolder inside.")
     ap.add_argument("--model", default=DEFAULT_CHAT_MODEL,
                     help=f"LLM model for segmentation boundary detection (default: {DEFAULT_CHAT_MODEL})")
